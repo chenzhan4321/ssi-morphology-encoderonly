@@ -89,13 +89,67 @@ python parse.py --model path/to/model.pth --file input.txt --output custom_outpu
 
 ## Model Architecture
 
-The model combines several advanced techniques:
+### Base Architecture
+- **Model Type**: Transformer Encoder with Character-level CNN
+- **Input Processing**: Character-level tokenization
+- **Output**: Sequence of morphological pattern labels
+- **Number of Classes**: 129 (including empty pattern)
+- **Maximum Sequence Length**: 128
 
-1. **Character Embedding**: Maps Syriac characters to dense vectors
-2. **Positional Encoding**: Adds positional information to embeddings
-3. **Character-level CNN**: Extracts local features from character sequences
-4. **Transformer Encoder**: Processes sequence-level features
-5. **Classification Head**: Predicts morphological patterns
+### Model Parameters
+- **Encoder Layers**: 12
+- **Attention Heads**: 12
+- **Hidden Dimension (d_model)**: 768
+- **Feedforward Dimension**: 3072 (d_model * 4)
+- **Dropout Rate**: 0.2
+- **Positional Encoding**: Sinusoidal positional embeddings
+- **Character CNN**: Three 1D convolutional layers with kernel size 3 and padding 1
+
+### Detailed Architecture Components
+
+1. **Character Embedding Layer**
+   - Input: Character indices (vocabulary size: 23)
+   - Output: Dense vectors (dimension: 768)
+   - Purpose: Convert discrete characters to continuous vector space
+
+2. **Positional Encoding**
+   - Type: Sinusoidal positional embeddings
+   - Maximum Length: 128
+   - Purpose: Provide position information to the model
+
+3. **Character-level CNN**
+   - Number of Layers: 3
+   - Kernel Size: 3
+   - Padding: 1
+   - Activation: GELU
+   - Batch Normalization: Yes
+   - Dropout: 0.2
+   - Purpose: Extract local character patterns
+
+4. **Transformer Encoder**
+   - Number of Layers: 12
+   - Number of Heads: 12
+   - Feedforward Dimension: 3072
+   - Activation: GELU
+   - Dropout: 0.2
+   - Layer Normalization: Pre-norm
+   - Purpose: Process sequence-level features
+
+5. **Classification Head**
+   - Input: Transformer output (768 dimensions)
+   - Hidden Layer: Linear (768 -> 768)
+   - Output: Linear (768 -> 129)
+   - Activation: GELU
+   - Layer Normalization: Yes
+   - Dropout: 0.2
+   - Purpose: Predict morphological patterns
+
+### Training Features
+- Mixed Precision Training (FP16)
+- Gradient Clipping (max norm: 1.0)
+- Class Weight Balancing
+- Learning Rate Scheduling
+- Early Stopping based on validation loss
 
 ## Performance Metrics
 
@@ -105,6 +159,16 @@ The system tracks multiple accuracy metrics:
 - Non-zero exact match accuracy
 - Overall accuracy
 - Loss metrics
+
+## SOTA Benchmarks:
+At default, the model reaches on c.a. 128th epoch at the best result:
+
+- Zero/Non-zero Ratio: 0.8372/0.1628
+- Zero to Zero Accuracy: 0.9760
+- Non-zero to Non-zero Accuracy: 0.9776
+- Non-zero Exact Match Accuracy: 0.8816
+- Overall Accuracy: 0.9607
+- Average Levenshtein Distance: 0.0452
 
 ## Data Format
 
