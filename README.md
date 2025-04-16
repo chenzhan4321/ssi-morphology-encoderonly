@@ -209,3 +209,13 @@ Syriac characters and their corresponding Latin transcriptions:
 
 ### Output Format
 The system generates morphological annotations for each character in the input text, with patterns defined in `patterns.csv`.
+
+## SOTA Benchmarks:
+At default, the model reaches on c.a. 128th epoch at the best result:
+
+- Zero/Non-zero Ratio: 0.8372/0.1628
+- Zero to Zero Accuracy: 0.9760
+- Non-zero to Non-zero Accuracy: 0.9776
+- Non-zero Exact Match Accuracy: 0.8816
+- Overall Accuracy: 0.9607
+- Average Levenshtein Distance: 0.0452
