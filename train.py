@@ -1,15 +1,17 @@
 import torch
 from torch.utils.data import DataLoader
-from torch.optim import Adam
+from torch.optim import Adam, AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.nn import CrossEntropyLoss
+from torch.amp import autocast  # 更新导入语句
+from torch.cuda.amp import GradScaler
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import numpy as np
 import math
 import torch.nn as nn
 import pandas as pd
-import Levenshtein  # Add Levenshtein distance calculation
+import Levenshtein
 
 from dataset import SyriacDataset
 from model import TransformerClassifier
@@ -57,9 +59,11 @@ def calculate_levenshtein_distance(predictions, labels, patterns_df):
     label_symbols = [label_to_symbol(l.item(), patterns_df) for l in labels]
     return Levenshtein.distance(''.join(pred_symbols), ''.join(label_symbols))
 
-def train_model(model, train_loader, val_loader, optimizer, scheduler, criterion, device, num_epochs=50):
+def train_model(model, train_loader, val_loader, optimizer, scheduler, criterion, device, num_epochs=200, max_grad_norm=1.0):
     best_val_loss = float('inf')
-    max_grad_norm = 1.0
+    
+    # 添加梯度缩放器用于混合精度训练
+    scaler = GradScaler()
     
     # Read patterns.csv
     patterns_df = pd.read_csv('patterns.csv')
@@ -90,17 +94,21 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, criterion
             labels = batch['labels'].long().to(device)
             
             optimizer.zero_grad()
-            outputs = model(input_ids)
             
-            batch_size, seq_len, num_classes = outputs.size()
-            outputs = outputs.view(-1, num_classes)
-            labels = labels.view(-1)
+            # 使用混合精度训练
+            with autocast(device_type='cuda'):  # 更新 autocast 调用
+                outputs = model(input_ids)
+                batch_size, seq_len, num_classes = outputs.size()
+                outputs = outputs.view(-1, num_classes)
+                labels = labels.view(-1)
+                loss = criterion(outputs, labels)
             
-            loss = criterion(outputs, labels)
-            loss.backward()
-            
+            # 使用梯度缩放器进行反向传播
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             
             # Detach loss before converting to scalar
             train_loss += loss.detach().item()
@@ -151,13 +159,13 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, criterion
                 input_ids = batch['input_ids'].to(device)
                 labels = batch['labels'].long().to(device)
                 
-                outputs = model(input_ids)
-                
-                batch_size, seq_len, num_classes = outputs.size()
-                outputs = outputs.view(-1, num_classes)
-                labels = labels.view(-1)
-                
-                loss = criterion(outputs, labels)
+                # 使用混合精度进行验证
+                with autocast(device_type='cuda'):  # 更新 autocast 调用
+                    outputs = model(input_ids)
+                    batch_size, seq_len, num_classes = outputs.size()
+                    outputs = outputs.view(-1, num_classes)
+                    labels = labels.view(-1)
+                    loss = criterion(outputs, labels)
                 
                 val_loss += loss.item()
                 predictions = outputs.argmax(dim=-1)
@@ -258,7 +266,7 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler, criterion
         print(f"6. Loss: {val_loss:.4f}")
         
         # Update learning rate
-        scheduler.step(val_loss)
+        scheduler.step()
         
         # Save best model
         if val_loss < best_val_loss:
@@ -323,10 +331,11 @@ def check_distribution(full_dataset, subset, name):
     return total_ones / total_samples if total_samples > 0 else 0
 
 class CustomLoss(nn.Module):
-    def __init__(self, zero_mistake_weight=2.5):
+    def __init__(self, zero_mistake_weight=3.0, nonzero_mistake_weight=2.0):
         super().__init__()
         self.base_criterion = nn.CrossEntropyLoss(reduction='none')
         self.zero_mistake_weight = zero_mistake_weight
+        self.nonzero_mistake_weight = nonzero_mistake_weight
         
     def forward(self, outputs, labels):
         # Calculate base cross entropy loss
@@ -336,10 +345,15 @@ class CustomLoss(nn.Module):
         predictions = outputs.argmax(dim=-1)  # [batch_size * seq_len]
         
         # Create penalty weights
-        # Increase penalty when true label is non-zero but prediction is zero
         weights = torch.ones_like(base_loss)
+        
+        # Increase penalty when true label is non-zero but prediction is zero
         zero_mistakes = (predictions == 0) & (labels > 0)
         weights[zero_mistakes] = self.zero_mistake_weight
+        
+        # Increase penalty when true label is non-zero and prediction is wrong
+        nonzero_mistakes = (predictions != labels) & (labels > 0)
+        weights[nonzero_mistakes] = self.nonzero_mistake_weight
         
         weighted_loss = (base_loss * weights).mean()
         return weighted_loss
@@ -486,6 +500,17 @@ def evaluate_model(model, test_loader, criterion, device):
     
     return test_loss, test_zero_acc, test_nonzero_acc, test_nonzero_exact_acc, test_overall_acc, test_levenshtein_distance
 
+class WarmupLinearSchedule(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps, total_steps, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.total_steps = total_steps
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_steps:
+            return [base_lr * self.last_epoch / self.warmup_steps for base_lr in self.base_lrs]
+        return [base_lr * max(0.0, (self.total_steps - self.last_epoch) / (self.total_steps - self.warmup_steps)) for base_lr in self.base_lrs]
+
 def main():
     # Set device
     device = get_device()
@@ -522,26 +547,29 @@ def main():
         seed=42
     )
     
-    # Create data loaders
+    # Create data loaders with larger batch size
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=32, 
+        batch_size=32,  # 增加batch size
         shuffle=True,
-        num_workers=4
+        num_workers=4,
+        pin_memory=True  # 启用pin_memory
     )
     
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=32, 
+        batch_size=32,  # 增加batch size
         shuffle=False,
-        num_workers=4
+        num_workers=4,
+        pin_memory=True  # 启用pin_memory
     )
     
     test_loader = DataLoader(
         test_dataset, 
-        batch_size=32, 
+        batch_size=32,  # 增加batch size
         shuffle=False,
-        num_workers=4
+        num_workers=4,
+        pin_memory=True  # 启用pin_memory
     )
     
     # Calculate class weights
@@ -551,13 +579,43 @@ def main():
     model = TransformerClassifier(num_classes=num_classes).to(device)
     print(f"\nNumber of model parameters: {sum(p.numel() for p in model.parameters())}")
     
-    # Define optimizer and loss function
-    optimizer = Adam(model.parameters(), lr=0.0001, weight_decay=0.01)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, min_lr=1e-6)
-    criterion = CustomLoss(zero_mistake_weight=2.0).to(device)
+    # Define optimizer with weight decay and gradient clipping
+    optimizer = AdamW(
+        model.parameters(),
+        lr=0.0002,  # 增加学习率
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
     
-    # Train model
-    train_model(model, train_loader, val_loader, optimizer, scheduler, criterion, device)
+    # Learning rate scheduler with warmup
+    num_training_steps = len(train_loader) * 100  # 100 epochs
+    num_warmup_steps = int(0.1 * num_training_steps)  # 10% warmup
+    
+    scheduler = WarmupLinearSchedule(
+        optimizer,
+        warmup_steps=num_warmup_steps,
+        total_steps=num_training_steps
+    )
+    
+    # Custom loss with increased penalties for non-zero mistakes
+    criterion = CustomLoss(
+        zero_mistake_weight=2.0,  # 降低零标签错误惩罚
+        nonzero_mistake_weight=5.0  # 增加非零标签错误惩罚
+    ).to(device)
+    
+    # Train model with more epochs and gradient clipping
+    train_model(
+        model, 
+        train_loader, 
+        val_loader, 
+        optimizer, 
+        scheduler, 
+        criterion, 
+        device, 
+        num_epochs=200,
+        max_grad_norm=1.0
+    )
     
     # Load best model for testing
     print("\nLoading best model for testing...")
